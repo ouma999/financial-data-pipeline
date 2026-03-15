@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Real-Time Financial Data Pipeline
+  AWS Data Engineering Demo Project
+  Services: Kinesis, S3 Data Lake, Glue, Athena, EventBridge, CloudWatch, IAM
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: financial-pipeline
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  KinesisShards:
+    Type: Number
+    Default: 1
+    Description: Number of Kinesis shards (1 shard = 1MB/s ingestion)
+
+  GlueJobSchedule:
+    Type: String
+    Default: "cron(0 * * * ? *)"
+    Description: How often Glue ETL runs (default every hour)
+
+Resources:
+
+  # ── S3: Raw Data Lake Zone ────────────────────────────────────────────────
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-raw-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: MoveToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Zone
+          Value: raw
+
+  # ── S3: Processed Data Lake Zone ──────────────────────────────────────────
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-processed-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Zone
+          Value: processed
+
+  # ── S3: Glue Scripts Bucket ───────────────────────────────────────────────
+  GlueScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-glue-scripts-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── S3: Athena Query Results ──────────────────────────────────────────────
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-athena-results-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── Kinesis: Data Stream ──────────────────────────────────────────────────
+  FinancialDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub "${ProjectName}-stream-${Environment}"
+      ShardCount: !Ref KinesisShards
+      RetentionPeriodHours: 24
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── Kinesis Firehose: Stream to S3 ───────────────────────────────────────
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "${ProjectName}-firehose-${Environment}"
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt FinancialDataStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt RawDataBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: "raw/stock_prices/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+        ErrorOutputPrefix: "errors/"
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 128
+        CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub "/aws/firehose/${ProjectName}"
+          LogStreamName: "S3Delivery"
+
+  # ── IAM: Firehose Role ────────────────────────────────────────────────────
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-firehose-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehosePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub "${RawDataBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListShards
+                Resource: !GetAtt FinancialDataStream.Arn
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # ── IAM: Glue Role ────────────────────────────────────────────────────────
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub "${RawDataBucket.Arn}/*"
+                  - !GetAtt GlueScriptsBucket.Arn
+                  - !Sub "${GlueScriptsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !Sub "${ProcessedDataBucket.Arn}/*"
+
+  # ── Glue: Database ────────────────────────────────────────────────────────
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: financial_data
+        Description: Financial market data — processed by Glue ETL
+
+  # ── Glue: ETL Job ─────────────────────────────────────────────────────────
+  GlueETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-etl-${Environment}"
+      Role: !GetAtt GlueRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${GlueScriptsBucket}/scripts/etl_transform.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--JOB_NAME": !Sub "${ProjectName}-etl-${Environment}"
+        "--SOURCE_BUCKET": !Ref RawDataBucket
+        "--DEST_BUCKET": !Ref ProcessedDataBucket
+        "--SOURCE_PREFIX": "raw/stock_prices"
+        "--DEST_PREFIX": "processed/stock_prices"
+        "--enable-metrics": ""
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-bookmark-option": "job-bookmark-enable"
+      MaxRetries: 1
+      Timeout: 60
+      GlueVersion: "4.0"
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+      Tags:
+        Project: !Ref ProjectName
+
+  # ── EventBridge: Schedule Glue Job ───────────────────────────────────────
+  GlueJobScheduler:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-glue-schedule-${Environment}"
+      Description: "Triggers Glue ETL job hourly"
+      ScheduleExpression: !Ref GlueJobSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueETLJob}"
+          Id: GlueETLTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # ── IAM: EventBridge Role ─────────────────────────────────────────────────
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-eventbridge-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartGlueJob
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: glue:StartJobRun
+                Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueETLJob}"
+
+  # ── Athena: Workgroup ─────────────────────────────────────────────────────
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-workgroup-${Environment}"
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/results/"
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824  # 1GB limit per query
+
+  # ── CloudWatch: Pipeline Monitoring ──────────────────────────────────────
+  KinesisThrottlingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-kinesis-throttling"
+      MetricName: WriteProvisionedThroughputExceeded
+      Namespace: AWS/Kinesis
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref FinancialDataStream
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+
+  GlueJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-glue-failures"
+      MetricName: glue.driver.aggregate.numFailedTasks
+      Namespace: Glue
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  KinesisStreamName:
+    Value: !Ref FinancialDataStream
+    Description: Kinesis stream name for producer
+
+  RawBucketName:
+    Value: !Ref RawDataBucket
+    Description: S3 raw data lake bucket
+
+  ProcessedBucketName:
+    Value: !Ref ProcessedDataBucket
+    Description: S3 processed data lake bucket
+
+  GlueJobName:
+    Value: !Ref GlueETLJob
+    Description: Glue ETL job name
+
+  AthenaWorkgroup:
+    Value: !Ref AthenaWorkgroup
+    Description: Athena workgroup name
+
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Description: Glue catalog database name
