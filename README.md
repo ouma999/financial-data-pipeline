@@ -3,7 +3,7 @@
 > **AWS Data Engineering Demo Project**
 > An end-to-end real-time data pipeline that ingests live stock market data, processes it with ETL transformations, stores it in a data lake, and serves it for SQL analytics — built entirely on AWS managed services.
 
-I designed and built a real-time financial data pipeline on AWS using Kinesis, S3 Data Lake, Glue PySpark ETL, and Athena — deployed via CloudFormation IaC. The pipeline ingests live stock data, engineers 15+ technical indicators including actuarial VaR metrics, and serves processed Parquet data for SQL analytics
+> ** I designed and built a real-time financial data pipeline on AWS using Kinesis, S3 Data Lake, Glue PySpark ETL, and Athena — deployed > via CloudFormation IaC. The pipeline ingests live stock data, engineers 15+ technical indicators including actuarial VaR metrics, and     serves processed Parquet data for SQL analytics
 ---
 
 ## 🏗️ Architecture
